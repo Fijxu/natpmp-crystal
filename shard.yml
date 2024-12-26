@@ -1,0 +1,13 @@
+name: natpmpcrystal
+version: 0.1.0
+
+authors:
+  - Fijxu <fijxu@nadeko.net>
+
+targets:
+  natpmpcrystal:
+    main: src/natpmpcrystal.cr
+
+crystal: '>= 1.14.0'
+
+license: MIT
