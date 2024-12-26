@@ -1,0 +1,9 @@
+name: natpmp-crystal
+version: 0.1.0
+
+authors:
+  - Fijxu <fijxu@nadeko.net>
+
+crystal: '>= 1.14.0'
+
+license: MIT
