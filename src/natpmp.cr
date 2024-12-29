@@ -11,26 +11,16 @@ module NatPMP
     UNSUPPORTED_OPCODE        = 5
   end
 
-  enum OP : UInt8
-    UDP = 1_u8
-    TCP = 2_u8
-  end
-
   struct MappingPacket
     @vers : UInt8 = 0_u8
-    @op : UInt8 = OP::UDP.value
+    @op : UInt8
     @reserved : UInt16 = 0_u16
     @internal_port : UInt16
     @external_port : UInt16
     @lifetime : UInt32 = 0_u32
 
-    def initialize(@internal_port, @external_port, @lifetime = 0, @op = UDP)
-      unless [1, 2].include?(@op)
-        raise ArgumentError, "Operation should be either '1_u8' for UDP or '2_u8' for TCP (default: UDP)"
-      end
-    end
-
-    def initialize(@internal_port, @external_port)
+    def initialize(@internal_port, @external_port, @lifetime = 7200, @op = 1)
+      raise ArgumentError.new("operation should be either 1_u8 for UDP or 2_u8 for TCP") if ![1, 2].includes?(@op)
     end
 
     def to_io
@@ -45,17 +35,17 @@ module NatPMP
     end
 
     def to_slice
+      # This is not actually a Slice, it's an StaticArray so I don't
+      # think this member function should be called like this.
       slice = uninitialized UInt8[12]
-      IO::ByteFormat::BigEndian.encode(@vers, v = Bytes.new(1))
       IO::ByteFormat::BigEndian.encode(@op, o = Bytes.new(1))
-      # IO::ByteFormat::BigEndian.encode(@reserved, r = Bytes.new(2))
       IO::ByteFormat::BigEndian.encode(@internal_port, i = Bytes.new(2))
       IO::ByteFormat::BigEndian.encode(@external_port, e = Bytes.new(2))
       IO::ByteFormat::BigEndian.encode(@lifetime, l = Bytes.new(4))
-      slice[0] = v[0]
+      slice[0] = 0 # vers is always 0
       slice[1] = o[0]
-      slice[2] = 0 # RESERVED
-      slice[3] = 0 # RESERVED
+      slice[2] = 0 # RESERVED, always 0
+      slice[3] = 0 # RESERVED, always 0
       slice[4] = i[0]
       slice[5] = i[1]
       slice[6] = e[0]
@@ -69,7 +59,7 @@ module NatPMP
   end
 
   class Client
-    @client : UDPSocket
+    @socket : UDPSocket
     @gateway_ip : String
 
     # Overload
@@ -77,41 +67,46 @@ module NatPMP
       initialize(gateway_ip.path)
     end
 
-    def initialize(@gateway_ip : String)
-      @client = UDPSocket.new
+    def initialize(@gateway_ip : String, autoconnect : Bool = true)
+      # The specification is IPV4 only!
+      @socket = UDPSocket.new(Socket::Family::INET)
       # A given host may have more than one independent
       # NAT-PMP client running at the same time, and address announcements
       # need to be available to all of them.  Clients should therefore set
       # the SO_REUSEPORT option or equivalent in order to allow other
       # processes to also listen on port 5350.
-      @client.reuse_port = true
+      @socket.reuse_port = true
+      @socket.reuse_address = true
       # Additionally, implementers
       # have encountered issues when one or more processes on the same device
       # listen to port 5350 on *all* addresses.  Clients should therefore
       # bind specifically to 224.0.0.1:5350, not to 0.0.0.0:5350.
-      # @client.bind("224.0.0.1", 5350)
-      connect()
+      @socket.bind 5350
+      if autoconnect
+        connect()
+      end
     end
 
     def connect
-      # @client.join_group(Socket::IPAddress.new("224.0.0.1", 5351))
-      @client.connect(@gateway_ip, 5351)
+      # @socket.join_group(Socket::IPAddress.new("224.0.0.1", 5351))
+      @socket.connect(@gateway_ip, 5351)
     end
 
     def send_public_address_request_raw : Bytes
-      @client.send("\x00\x00")
+      @socket.send("\x00\x00")
       msg = Bytes.new(12)
-      @client.receive(msg)
+      @socket.receive(msg)
       return msg
     end
 
     def send_public_address_request
-      @client.send("\x00\x00")
+      @socket.send("\x00\x00")
       msg = Bytes.new(12)
-      @client.read_timeout = 250.milliseconds
+      @socket.read_timeout = 250.milliseconds
+
       8.times do |i|
         begin
-          @client.receive(msg)
+          @socket.receive(msg)
           break
         rescue IO::TimeoutError
           # If no
@@ -119,7 +114,7 @@ module NatPMP
           # client retransmits its request and waits 500 ms.  The client SHOULD
           # repeat this process with the interval between attempts doubling each
           # time.
-          @client.read_timeout = @client.read_timeout.not_nil!*2
+          @socket.read_timeout = @socket.read_timeout.not_nil!*2
           next
         rescue
           raise "The gateway '#{@gateway_ip}' does not support NAT-PMP"
@@ -127,10 +122,10 @@ module NatPMP
         end
       end
 
-      vers = msg[0]
-      op = msg[1]
-      result_code = get_result_code(msg[2..3])
-      epoch = get_epoch(msg[4..7])
+      vers : UInt8 = msg[0]
+      op : UInt8 = msg[1]
+      result_code = decode_msg(UInt16, msg[2..3])
+      epoch = decode_msg(UInt32, msg[4..7])
 
       # If the result code is non-zero, the value of the External
       # IPv4 Address field is undefined (MUST be set to zero on transmission,
@@ -143,72 +138,47 @@ module NatPMP
       return vers, op, result_code, epoch, ip_address
     end
 
-    def request_mapping(internal_port : UInt16, external_port : UInt16, lifetime : Uint32, operation : UInt8)
-      request = MappingPacket.new(internal_port, external_port, lifetime, operation)
+    def request_mapping(internal_port : UInt16, external_port : UInt16, operation : UInt8, lifetime : UInt32 = 7200)
+      request = MappingPacket.new(internal_port, external_port, lifetime, operation).to_slice
       msg = Bytes.new(16)
-      @client.receive(msg)
-      vers = msg[0]
-      op = msg[1]
-      result_code = get_result_code(msg[2..3])
-      epoch = get_epoch(msg[4..7])
-      internal_port = get_port(msg[8..9])
-      external_port = get_port(msg[10..11])
-      lifetime = get_lifetime(msg[12..15])
+      @socket.send(request)
+      @socket.receive(msg)
+
+      vers : UInt8 = msg[0]
+      op : UInt8 = msg[1]
+      result_code = decode_msg(UInt16, msg[2..3])
+      epoch = decode_msg(UInt32, msg[4..7])
+      internal_port = decode_msg(UInt16, msg[8..9])
+      external_port = decode_msg(UInt16, msg[10..11])
+      lifetime = decode_msg(UInt32, msg[12..15])
+
       return vers, op, result_code, epoch, internal_port, external_port, lifetime
     end
 
-    private def get_result_code(msg)
-      # Responses always contain a
-      # 16-bit result code in network byte order
-      return IO::ByteFormat::BigEndian.decode(UInt16, msg)
+    # https://datatracker.ietf.org/doc/html/rfc6886#section-3.4
+    def destroy_mapping(internal_port : UInt16, operation : UInt8)
+      request = MappingPacket.new(internal_port, 0, 0, operation).to_slice
+      msg = Bytes.new(16)
+      @socket.send(request)
+      @socket.receive(msg)
+
+      vers : UInt8 = msg[0]
+      op : UInt8 = msg[1]
+      result_code = decode_msg(UInt16, msg[2..3])
+      epoch = decode_msg(UInt32, msg[4..7])
+      internal_port = decode_msg(UInt16, msg[8..9])
+      external_port = decode_msg(UInt16, msg[10..11])
+      lifetime = decode_msg(UInt32, msg[12..15])
+
+      return vers, op, result_code, epoch, internal_port, external_port, lifetime
     end
 
-    # Seconds Since Start of Epoch
-    private def get_epoch(msg)
-      # Responses also contain a 32-bit unsigned integer
-      # corresponding to the number of seconds since the NAT gateway was
-      # rebooted or since its port mapping state was otherwise reset.
-      return IO::ByteFormat::BigEndian.decode(UInt32, msg)
-    end
-
-    private def get_port(msg)
-      return IO::ByteFormat::BigEndian.decode(UInt16, msg)
+    private macro decode_msg(type, msg)
+      IO::ByteFormat::BigEndian.decode({{type}}, {{msg}})
     end
 
     private def get_ip_address(msg)
       "#{msg[0]}.#{msg[1]}.#{msg[2]}.#{msg[3]}"
     end
-
   end
 end
-
-# client = NatPMP::Client.new("192.168.0.1")
-# pp client.send_public_address_request
-pp mapping_packet = NatPMP::MappingPacket.new(25555,25555)
-
-Benchmark.ips do |x|
-  x.report("bytes") do
-    mapping_packet.to_io
-  end
-
-  x.report("staticarray") do
-    # pp mapping_packet.to_io.to_slice
-    mapping_packet.to_slice
-  end
-
-  x.report("staticarray to io") do
-    # pp mapping_packet.to_io.to_slice
-    mapping_packet.to_slice
-  end
-end
-
-pp typeof(mapping_packet)
-
-# xd = client.send_public_address_request_raw
-# pp xd
-
-# request = client.request_mapping(25580, 25580)
-
-# request2 = client.request_mapping(1, 255802, 25580, 0)
-
-# pp request
