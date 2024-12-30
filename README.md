@@ -33,7 +33,7 @@ client.destroy_mapping(25565, 2) # => {0, 130, 0, 22758, 25565, 0, 0}
 
 # Maps the internal port 22000 to external port 22000, UDP
 client.request_mapping(22000, 22000, 1) # => {0, 129, 0, 22758, 22000, 22000, 7200}
-# Destroys the mapping with internal port 25565, TCP
+# Destroys the mapping with internal port 22000, UDP
 client.destroy_mapping(22000, 1) # => {0, 129, 0, 22758, 22000, 0, 0}
 ```
 
