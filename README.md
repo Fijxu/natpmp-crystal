@@ -10,7 +10,7 @@ Since RFC 6886 is a pretty simple protocol, it should be ready to use to request
 
    ```yaml
    dependencies:
-     test:
+     natpmp-crystal:
        github: fijxu/natpmp-crystal
    ```
 
@@ -19,12 +19,14 @@ Since RFC 6886 is a pretty simple protocol, it should be ready to use to request
 ## Usage
 
 ```crystal
+require "natpmp"
+
 # Create NAT-PMP client, replace the IP by the IP of your
 # gateway
 client = NatPMP::Client.new("192.168.1.1")
 # Public address request
-client.send_public_address_request # => {0, 128, 0, 22758, "104.0.0.0"}
-client.send_public_address_request_raw # => Bytes[0, 128, 0, 0, 0, 0, 88, 230, 104, 0, 0, 0]
+client.send_external_address_request # => {0, 128, 0, 22758, "104.0.0.0"}
+client.send_external_address_request_as_bytes # => Bytes[0, 128, 0, 0, 0, 0, 88, 230, 104, 0, 0, 0]
 
 # Maps the internal port 25565 to external port 25565, TCP
 client.request_mapping(25565, 25565, 2) # => {0, 130, 0, 22758, 25565, 25565, 7200}
