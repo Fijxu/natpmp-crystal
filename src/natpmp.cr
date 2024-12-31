@@ -1,7 +1,9 @@
 require "socket"
-require "benchmark"
 
 module NatPMP
+  # Result codes defined by the RFC 6886
+  #
+  # [RFC 6886 - 3.5.  Result Codes](https://datatracker.ietf.org/doc/html/rfc6886#section-3.5)
   enum ResultCodes
     SUCCESS                   = 0
     UNSUPPORTED_VERSION       = 1
@@ -11,18 +13,38 @@ module NatPMP
     UNSUPPORTED_OPCODE        = 5
   end
 
+  # Opcodes defined by the RFC 6886
+  #
+  # *"Otherwise, if the opcode in the request is less than 128, but is not a supported opcode **(currently 0, 1, or 2)**"*
+  #
+  # [RFC 6886 - 3.5.  Result Codes](https://datatracker.ietf.org/doc/html/rfc6886#section-3.5)
+  enum OP : UInt8
+    NOOP = 0_u8
+    UDP  = 1_u8
+    TCP  = 2_u8
+  end
+
+  # You can use this struct to craft your own mapping packets in case you want
+  # to handle it all by yourself.
+  #
+  # ```
+  # # This creates a mapping that you can use to send trough a Socket
+  # packet_io = NatPMP::MappingPacket.new(25565, 25565, 1, 3600).to_io
+  # packet_slice = NatPMP::MappingPacket.new(25565, 25565, 1, 3600).to_slice
+  # ```
   struct MappingPacket
     @vers : UInt8 = 0_u8
     @op : UInt8
     @reserved : UInt16 = 0_u16
     @internal_port : UInt16
     @external_port : UInt16
-    @lifetime : UInt32 = 0_u32
+    @lifetime : UInt32
 
-    def initialize(@internal_port, @external_port, @lifetime = 7200, @op = 1)
+    def initialize(@internal_port, @external_port, @op = 1, @lifetime = 7200)
       raise ArgumentError.new("operation should be either 1_u8 for UDP or 2_u8 for TCP") if ![1, 2].includes?(@op)
     end
 
+    # Converts the struct instance variables to IO.
     def to_io
       io = IO::Memory.new(12)
       io.write_bytes(@vers, IO::ByteFormat::BigEndian)
@@ -31,12 +53,14 @@ module NatPMP
       io.write_bytes(@internal_port, IO::ByteFormat::BigEndian)
       io.write_bytes(@external_port, IO::ByteFormat::BigEndian)
       io.write_bytes(@lifetime, IO::ByteFormat::BigEndian)
-      return io
+      io
     end
 
+    # Converts the struct instance variables to an StaticArray.
+    #
+    # Side Note: This is not actually a Slice, it's an StaticArray so I don't
+    # think this member function should be called like this.
     def to_slice
-      # This is not actually a Slice, it's an StaticArray so I don't
-      # think this member function should be called like this.
       slice = uninitialized UInt8[12]
       IO::ByteFormat::BigEndian.encode(@op, o = Bytes.new(1))
       IO::ByteFormat::BigEndian.encode(@internal_port, i = Bytes.new(2))
@@ -54,7 +78,7 @@ module NatPMP
       slice[9] = l[1]
       slice[10] = l[2]
       slice[11] = l[3]
-      return slice
+      slice
     end
   end
 
@@ -62,11 +86,21 @@ module NatPMP
     @socket : UDPSocket
     @gateway_ip : String
 
-    # Overload
-    def initialize(gateway_ip : URI)
-      initialize(gateway_ip.path)
+    def initialize(gateway_ip : URI, autoconnect : Bool = true)
+      initialize(gateway_ip.path, autoconnect)
     end
 
+    # Creates a new NAT-PMP Client, it's only able to connect trough IPV4 so
+    # if you supply a IPV6 address, it will fail;
+    # By default, it connects automatically to the NAT-PMP server, you can
+    # change this by setting `autoconnect` to false like this:
+    # `client = NatPMP::Client.new("192.168.1.1", false)`, that way, you can
+    # change the socket properties like `client.@socket.bind` to your liking
+    # before connecting.
+    #
+    # ```
+    # client = NatPMP::Client.new("192.168.1.1")
+    # ```
     def initialize(@gateway_ip : String, autoconnect : Bool = true)
       # The specification is IPV4 only!
       @socket = UDPSocket.new(Socket::Family::INET)
@@ -78,18 +112,13 @@ module NatPMP
       end
     end
 
-    def connect
+    # Connects to the NAT-PMP server, you don't need to call this function
+    # unless you have setted `autoconnect` is false on the constructor.
+    def connect : Nil
       @socket.connect(@gateway_ip, 5351)
     end
 
-    def send_public_address_request_raw : Bytes
-      @socket.send("\x00\x00")
-      msg = Bytes.new(12)
-      @socket.receive(msg)
-      return msg
-    end
-
-    def send_public_address_request
+    private def send_external_address_request_ : Bytes
       @socket.send("\x00\x00")
       msg = Bytes.new(12)
       @socket.read_timeout = 250.milliseconds
@@ -107,6 +136,32 @@ module NatPMP
         end
       end
 
+      msg
+    end
+
+    # Returns the external address response as a `Slice(UInt8)`
+    #
+    # ```
+    # client.send_external_address_request_as_bytes # => Bytes[0, 128, 0, 0, 0, 0, 88, 230, 104, 0, 0, 0]
+    # ```
+    def send_external_address_request_as_bytes : Bytes
+      msg = send_external_address_request_
+      msg
+    end
+
+    # Returns the external address response as a `Tuple(UInt8, UInt8, UInt16, UInt32, String | Nil)`
+    #
+    # ```
+    # res = client.send_external_address_request # => {0, 128, 0, 177060, "104.0.0.0"}
+    # version = res[0]
+    # operation = res[1]
+    # result_code = res[2]
+    # epoch = res[3]
+    # external_address = res[4]
+    # ```
+    def send_external_address_request : Tuple(UInt8, UInt8, UInt16, UInt32, String | Nil)
+      msg = send_external_address_request_
+
       vers : UInt8 = msg[0]
       op : UInt8 = msg[1]
       result_code = decode_msg(UInt16, msg[2..3])
@@ -120,9 +175,23 @@ module NatPMP
       return vers, op, result_code, epoch, ip_address
     end
 
-    # https://datatracker.ietf.org/doc/html/rfc6886#section-3.3
-    def request_mapping(internal_port : UInt16, external_port : UInt16, operation : UInt8, lifetime : UInt32 = 7200)
-      request = MappingPacket.new(internal_port, external_port, lifetime, operation).to_slice
+    # Requests a mapping to the NAT-PMP server
+    #
+    # More details about how requesting a mapping works here: [RFC 6886 - 3.3. Requesting a Mapping](https://datatracker.ietf.org/doc/html/rfc6886#section-3.3)
+    # ```
+    # # Maps the internal port 25565 to external port 25565, TCP, with a lifetime
+    # # of 7200 seconds (the default defined by the RFC)
+    # client.request_mapping(25565, 25565, 2) # => {0, 130, 0, 22758, 25565, 25565, 7200}
+    # # The same as above, but with a lifetime of 60 seconds
+    # client.request_mapping(25565, 25565, 2, 60) # => {0, 130, 0, 22758, 25565, 25565, 60}
+    # # Maps the internal port 25565 to external port 25565, UDP, with a lifetime
+    # # of 7200 seconds (the default defined by the RFC)
+    # client.request_mapping(25565, 25565, 1) # => {0, 129, 0, 22758, 25565, 25565, 7200}
+    # # The same as above, but with a lifetime of 60 seconds
+    # client.request_mapping(25565, 25565, 1, 60) # => {0, 129, 0, 22758, 25565, 25565, 60}
+    # ```
+    def request_mapping(internal_port : UInt16, external_port : UInt16, operation : UInt8, lifetime : UInt32 = 7200) : Tuple(UInt8, UInt8, UInt16, UInt32, UInt16, UInt16, UInt32)
+      request = MappingPacket.new(internal_port, external_port, operation, lifetime).to_slice
       msg = Bytes.new(16)
       @socket.send(request)
       @socket.receive(msg)
@@ -138,9 +207,17 @@ module NatPMP
       return vers, op, result_code, epoch, internal_port, external_port, lifetime
     end
 
-    # https://datatracker.ietf.org/doc/html/rfc6886#section-3.4
-    def destroy_mapping(internal_port : UInt16, operation : UInt8)
-      request = MappingPacket.new(internal_port, 0, 0, operation).to_slice
+    # Destroys a mapping in the NAT-PMP server
+    #
+    # More details about how destroying a mapping works here: [RFC 6886 - 3.4. Destoying a Mapping](https://datatracker.ietf.org/doc/html/rfc6886#section-3.4)
+    # ```
+    # # Destroys the mapping with internal port 25565, TCP
+    # client.destroy_mapping(25565, 2) # => {0, 130, 0, 22758, 25565, 0, 0}
+    # # Destroys the mapping with internal port 25565, UDP
+    # client.destroy_mapping(25565, 1) # => {0, 130, 0, 22758, 25565, 0, 0}
+    # ```
+    def destroy_mapping(internal_port : UInt16, operation : UInt8) : Tuple(UInt8, UInt8, UInt16, UInt32, UInt16, UInt16, UInt32)
+      request = MappingPacket.new(internal_port, 0, operation, 0).to_slice
       msg = Bytes.new(16)
       @socket.send(request)
       @socket.receive(msg)
